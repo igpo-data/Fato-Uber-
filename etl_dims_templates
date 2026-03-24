@@ -1,0 +1,129 @@
+CREATE OR REPLACE FUNCTION uber.etl_dims_templates () RETURNS void LANGUAGE plpgsql AS $function$
+DECLARE
+    t RECORD;
+    sql TEXT;
+BEGIN
+    -- garante valor padrão
+    INSERT INTO uber.dim_despesa (detalhamento_despesa)
+    VALUES ('SEM DETALHAMENTO')
+    ON CONFLICT (detalhamento_despesa) DO NOTHING;
+
+    FOR t IN
+        SELECT c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname LIKE 'uber_template%'
+        ORDER BY c.relname
+    LOOP
+
+        sql := format($fmt$
+
+            DROP TABLE IF EXISTS tmp_src;
+
+            CREATE TEMP TABLE tmp_src ON COMMIT DROP AS
+            SELECT
+                NULLIF(trim("Nome"), '') AS nome,
+                NULLIF(trim("Sobrenome"), '') AS sobrenome,
+                NULLIF(lower(trim("E-mail")), '') AS email,
+
+                NULLIF(trim("País"), '') AS pais,
+                NULLIF(trim("Cidade"), '') AS cidade,
+
+                COALESCE(NULLIF(trim("Detalhamento da despesa"), ''), 'SEM DETALHAMENTO') AS detalhamento_despesa,
+
+                NULLIF(trim("Programa"), '') AS programa,
+                NULLIF(trim("Forma de pagamento"), '') AS forma_pagamento,
+                NULLIF(trim("Serviço"), '') AS servico,
+                NULLIF(trim("Tipo de transação"), '') AS tipo_transacao
+
+            FROM public.%I;
+
+            -- =========================
+            -- dim_pais
+            -- =========================
+            INSERT INTO uber.dim_pais (pais)
+            SELECT DISTINCT pais
+            FROM tmp_src
+            WHERE pais IS NOT NULL
+            ON CONFLICT (pais) DO NOTHING;
+
+            -- =========================
+            -- dim_cidade
+            -- =========================
+            INSERT INTO uber.dim_cidade (cidade)
+            SELECT DISTINCT cidade
+            FROM tmp_src
+            WHERE cidade IS NOT NULL
+            ON CONFLICT (cidade) DO NOTHING;
+
+            -- =========================
+            -- dim_despesa
+            -- =========================
+            INSERT INTO uber.dim_despesa (detalhamento_despesa)
+            SELECT DISTINCT detalhamento_despesa
+            FROM tmp_src
+            WHERE detalhamento_despesa IS NOT NULL
+            ON CONFLICT (detalhamento_despesa) DO NOTHING;
+
+            -- =========================
+            -- dim_programa
+            -- =========================
+            INSERT INTO uber.dim_programa (programa)
+            SELECT DISTINCT programa
+            FROM tmp_src
+            WHERE programa IS NOT NULL
+            ON CONFLICT (programa) DO NOTHING;
+
+            -- =========================
+            -- dim_forma_pagamento
+            -- =========================
+            INSERT INTO uber.dim_forma_pagamento (forma_pagamento)
+            SELECT DISTINCT forma_pagamento
+            FROM tmp_src
+            WHERE forma_pagamento IS NOT NULL
+            ON CONFLICT (forma_pagamento) DO NOTHING;
+
+            -- =========================
+            -- dim_servico
+            -- =========================
+            INSERT INTO uber.dim_servico (servico)
+            SELECT DISTINCT servico
+            FROM tmp_src
+            WHERE servico IS NOT NULL
+            ON CONFLICT (servico) DO NOTHING;
+
+            -- =========================
+            -- dim_tipo_transacao
+            -- =========================
+            INSERT INTO uber.dim_tipo_transacao (tipo_transacao)
+            SELECT DISTINCT tipo_transacao
+            FROM tmp_src
+            WHERE tipo_transacao IS NOT NULL
+            ON CONFLICT (tipo_transacao) DO NOTHING;
+
+            -- =========================
+            -- dim_emails
+            -- =========================
+            INSERT INTO uber.dim_emails (nome, sobrenome, email)
+            SELECT DISTINCT ON (email)
+                nome,
+                sobrenome,
+                email
+            FROM tmp_src
+            WHERE email IS NOT NULL
+            ORDER BY email, nome NULLS LAST, sobrenome NULLS LAST
+            ON CONFLICT (email) DO UPDATE
+            SET
+                nome = COALESCE(EXCLUDED.nome, uber.dim_emails.nome),
+                sobrenome = COALESCE(EXCLUDED.sobrenome, uber.dim_emails.sobrenome);
+
+        $fmt$, t.table_name);
+
+        EXECUTE sql;
+
+    END LOOP;
+
+END;
+$function$
