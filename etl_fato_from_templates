@@ -1,0 +1,240 @@
+CREATE OR REPLACE FUNCTION uber.etl_fato_from_templates () RETURNS void LANGUAGE plpgsql AS $function$
+DECLARE
+    t RECORD;
+    sql TEXT;
+    template_n INT;
+    valor_expr TEXT;
+    data_filter TEXT;
+BEGIN
+    FOR t IN
+        SELECT c.relname AS table_name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relkind = 'r'
+          AND c.relname IN (
+              'uber_template_1',
+              'uber_template_2',
+              'uber_template_3',
+              'uber_template_4',
+              'uber_template_5'
+          )
+        ORDER BY c.relname
+    LOOP
+        template_n := regexp_replace(t.table_name, '^uber_template_([0-9]+)$', '\1')::int;
+
+        -- regra de data por template
+        IF template_n = 1 THEN
+            data_filter := 's."Data da solicitação (local)"::date BETWEEN DATE ''2024-02-20'' AND DATE ''2025-09-27''';
+        ELSIF template_n = 2 THEN
+            data_filter := 's."Data da solicitação (local)"::date BETWEEN DATE ''2024-03-26'' AND DATE ''2025-03-21''';
+        ELSIF template_n = 3 THEN
+            data_filter := 's."Data da solicitação (local)"::date BETWEEN DATE ''2025-06-16'' AND DATE ''2025-08-22''';
+        ELSIF template_n = 4 THEN
+            data_filter := 's."Data da solicitação (local)"::date > DATE ''2026-03-14''';
+        ELSIF template_n = 5 THEN
+            data_filter := 's."Data da solicitação (local)"::date BETWEEN DATE ''2025-11-20'' AND DATE ''2025-11-22''';
+        END IF;
+
+        /*
+          Descobre qual coluna de valor existe na tabela atual.
+          Ordem de prioridade:
+          1) Valor da transação: BRL
+          2) Valor em BRL (sem tributos)
+          3) Valor da transação na moeda local (com tributos)
+        */
+        SELECT
+            CASE
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = t.table_name
+                      AND column_name = 'Valor da transação: BRL'
+                ) THEN 's."Valor da transação: BRL"'
+
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = t.table_name
+                      AND column_name = 'Valor em BRL (sem tributos)'
+                ) THEN 's."Valor em BRL (sem tributos)"'
+
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = t.table_name
+                      AND column_name = 'Valor da transação na moeda local (com tributos)'
+                ) THEN 's."Valor da transação na moeda local (com tributos)"'
+
+                ELSE 'NULL'
+            END
+        INTO valor_expr;
+
+        sql := format($fmt$
+            INSERT INTO uber.fato_uber (
+                data_solicitacao,
+                km_distancia,
+                source_table,
+                data_solicitacao_local,
+                hora_solicitacao_local,
+                data_chegada_local,
+                hora_chegada_local,
+                transacao_ts_utc,
+                cidade_id,
+                despesa_id,
+                pais_id,
+                forma_pagamento_id,
+                tipo_transacao_id,
+                servico_id,
+                programa_id,
+                email_id,
+                registro_transacao_utc,
+                duracao_min,
+                valor_extra_moeda_local,
+                valor_extra_brl,
+                endereco_partida,
+                endereco_destino,
+                valor_brl
+            )
+            SELECT
+                CASE
+                    WHEN s."Data da solicitação (local)" IS NOT NULL
+                     AND s."Hora da solicitação (local)" IS NOT NULL
+                    THEN s."Data da solicitação (local)"::date + s."Hora da solicitação (local)"::time
+                    ELSE NULL
+                END AS data_solicitacao,
+
+                CASE
+                    WHEN s."Distância (mi)" IS NOT NULL
+                    THEN ROUND((s."Distância (mi)"::numeric * 1.60934), 2)
+                    ELSE NULL
+                END AS km_distancia,
+
+                %L AS source_table,
+
+                CASE
+                    WHEN s."Data da solicitação (local)" IS NOT NULL
+                    THEN s."Data da solicitação (local)"::date
+                    ELSE NULL
+                END AS data_solicitacao_local,
+
+                CASE
+                    WHEN s."Hora da solicitação (local)" IS NOT NULL
+                    THEN s."Hora da solicitação (local)"::time
+                    ELSE NULL
+                END AS hora_solicitacao_local,
+
+                CASE
+                    WHEN s."Data de chegada (local)" IS NOT NULL
+                    THEN s."Data de chegada (local)"::date
+                    ELSE NULL
+                END AS data_chegada_local,
+
+                CASE
+                    WHEN s."Hora de chegada (local)" IS NOT NULL
+                    THEN s."Hora de chegada (local)"::time
+                    ELSE NULL
+                END AS hora_chegada_local,
+
+                CASE
+                    WHEN s."Registro de data e hora da transação (UTC)" IS NOT NULL
+                    THEN s."Registro de data e hora da transação (UTC)"::timestamp
+                    ELSE NULL
+                END AS transacao_ts_utc,
+
+                dc.cidade_id,
+                dd.despesa_id,
+                dpais.pais_id,
+                dfp.forma_pagamento_id,
+                dtt.tipo_transacao_id,
+                ds.servico_id,
+                dpr.programa_id,
+                de.email_id,
+
+                CASE
+                    WHEN s."Registro de data e hora da transação (UTC)" IS NOT NULL
+                    THEN s."Registro de data e hora da transação (UTC)"::timestamp
+                    ELSE NULL
+                END AS registro_transacao_utc,
+
+                CASE
+                    WHEN s."Duração (min)" IS NOT NULL
+                    THEN s."Duração (min)"::numeric
+                    ELSE NULL
+                END AS duracao_min,
+
+                CASE
+                    WHEN s."Valor extra em moeda local" IS NOT NULL
+                    THEN ROUND(s."Valor extra em moeda local"::numeric, 2)
+                    ELSE NULL
+                END AS valor_extra_moeda_local,
+
+                CASE
+                    WHEN s."Valor extra em BRL" IS NOT NULL
+                    THEN ROUND(s."Valor extra em BRL"::numeric, 2)
+                    ELSE NULL
+                END AS valor_extra_brl,
+
+                NULLIF(btrim(s."Endereço de partida"::text), '') AS endereco_partida,
+                NULLIF(btrim(s."Endereço de destino"::text), '') AS endereco_destino,
+
+                CASE
+                    WHEN %s IS NOT NULL
+                    THEN ROUND((%s)::numeric, 2)
+                    ELSE NULL
+                END AS valor_brl
+
+            FROM public.%I s
+
+            LEFT JOIN uber.dim_emails de
+                ON de.email = NULLIF(lower(btrim(s."E-mail"::text)), '')
+
+            LEFT JOIN uber.dim_cidade dc
+                ON dc.cidade = NULLIF(btrim(s."Cidade"::text), '')
+
+            LEFT JOIN uber.dim_despesa dd
+                ON dd.detalhamento_despesa = COALESCE(NULLIF(btrim(s."Detalhamento da despesa"::text), ''), 'SEM DETALHAMENTO')
+
+            LEFT JOIN uber.dim_pais dpais
+                ON dpais.pais = NULLIF(btrim(s."País"::text), '')
+
+            LEFT JOIN uber.dim_forma_pagamento dfp
+                ON dfp.forma_pagamento = NULLIF(btrim(s."Forma de pagamento"::text), '')
+
+            LEFT JOIN uber.dim_tipo_transacao dtt
+                ON dtt.tipo_transacao = NULLIF(btrim(s."Tipo de transação"::text), '')
+
+            LEFT JOIN uber.dim_servico ds
+                ON ds.servico = NULLIF(btrim(s."Serviço"::text), '')
+
+            LEFT JOIN uber.dim_programa dpr
+                ON dpr.programa = NULLIF(btrim(s."Programa"::text), '')
+
+            WHERE
+                s."Data da solicitação (local)" IS NOT NULL
+                AND %s
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM uber.fato_uber f
+                    WHERE f.data_solicitacao_local IS NOT DISTINCT FROM s."Data da solicitação (local)"::date
+                      AND f.hora_solicitacao_local IS NOT DISTINCT FROM s."Hora da solicitação (local)"::time
+                      AND f.email_id IS NOT DISTINCT FROM de.email_id
+                      AND f.endereco_destino IS NOT DISTINCT FROM NULLIF(btrim(s."Endereço de destino"::text), '')
+                      AND f.source_table = %L
+                );
+        $fmt$,
+        t.table_name,
+        valor_expr,
+        valor_expr,
+        t.table_name,
+        data_filter,
+        t.table_name
+        );
+
+        EXECUTE sql;
+    END LOOP;
+END;
+$function$
